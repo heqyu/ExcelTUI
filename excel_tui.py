@@ -8,9 +8,13 @@ Excel/CSV TUI 工具 - 终端界面只读查看 Excel/CSV 文件
 import argparse
 import bisect
 import csv
+import json
 import re
 import sys
 from pathlib import Path
+
+_CONFIG_DIR = Path.home() / ".exceltui"
+_COL_WIDTHS_FILE = _CONFIG_DIR / "column_widths.json"
 
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
@@ -30,6 +34,25 @@ from textual.message import Message
 from textual.screen import Screen
 from rich.markup import escape as rich_escape
 from textual.widgets import DataTable, Footer, Header, Input, Static
+
+
+def _loadColWidthsConfig() -> dict:
+    try:
+        if _COL_WIDTHS_FILE.exists():
+            return json.loads(_COL_WIDTHS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _saveColWidthsConfig(data: dict) -> None:
+    try:
+        _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        _COL_WIDTHS_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
 
 
 def _displayWidth(s: str) -> int:
@@ -315,6 +338,8 @@ class SheetViewScreen(Screen):
         Binding("p", "prev_match", "上一匹配", show=False),
         Binding("c", "copy_cell", "拷贝"),
         Binding("enter", "enter_row", "进入行"),
+        Binding("[", "decrease_col_width", "缩窄列"),
+        Binding("]", "increase_col_width", "加宽列"),
     ]
 
     def __init__(self, workbook, sheetName: str, filePath: str, **kwargs):
@@ -338,6 +363,8 @@ class SheetViewScreen(Screen):
         self.filterQuery: str | None = None
         self.filteredRows: list[int] | None = None
         self._filterViewIndex = 0
+        self.columnWidths: dict[int, int] = {}
+        self._defaultCellWidth = 12
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -347,6 +374,7 @@ class SheetViewScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._loadColumnWidths()
         self._renderGrid()
         self.set_timer(0.05, self._deferredRender)
 
@@ -379,6 +407,78 @@ class SheetViewScreen(Screen):
         except Exception:
             return 10
 
+    def _getColWidth(self, col: int) -> int:
+        return self.columnWidths.get(col, self._defaultCellWidth)
+
+    def _colConfigKey(self, col: int) -> str:
+        """列的配置键：优先用表头名，否则用 col_N。"""
+        name = getCellValue(self.ws, 1, col)
+        return name.strip() if name and name.strip() else f"col_{col}"
+
+    def _fileConfigKey(self) -> str:
+        return str(Path(self.filePath).resolve())
+
+    def _loadColumnWidths(self) -> None:
+        """从配置文件恢复当前文件+sheet 的列宽。"""
+        data = _loadColWidthsConfig()
+        sheetData = data.get(self._fileConfigKey(), {}).get(self.sheetName, {})
+        for col in range(1, self.maxCol + 1):
+            key = self._colConfigKey(col)
+            if key in sheetData:
+                w = sheetData[key]
+                if isinstance(w, int) and 4 <= w <= 80:
+                    self.columnWidths[col] = w
+
+    def _saveColumnWidths(self) -> None:
+        """将当前列宽写入配置文件。"""
+        data = _loadColWidthsConfig()
+        fileKey = self._fileConfigKey()
+        if fileKey not in data:
+            data[fileKey] = {}
+        sheetWidths: dict[str, int] = {}
+        for col, width in self.columnWidths.items():
+            sheetWidths[self._colConfigKey(col)] = width
+        data[fileKey][self.sheetName] = sheetWidths
+        _saveColWidthsConfig(data)
+
+    def _computeEndCol(self, rowNumWidth: int) -> int:
+        """从 viewLeftCol 开始，按各列实际宽度计算最后一个可见列。"""
+        try:
+            container = self.query_one("#gridContainer", ScrollableContainer)
+            w = container.size.width if container else 0
+            if w <= 0 and self.size.width > 0:
+                w = self.size.width - 4
+            usableWidth = max(1, w - 4 - rowNumWidth - 4)
+        except Exception:
+            usableWidth = 80
+        colSepWidth = 3
+        used = 0
+        for c in range(self.viewLeftCol, self.maxCol + 1):
+            if c > self.viewLeftCol:
+                used += colSepWidth
+            used += self._getColWidth(c)
+            if used > usableWidth and c > self.viewLeftCol:
+                return c - 1
+        return self.maxCol
+
+    def _computeViewLeftToShowCol(self, targetCol: int, rowNumWidth: int) -> int:
+        """计算 viewLeftCol，使 targetCol 刚好出现在视口右侧。"""
+        try:
+            container = self.query_one("#gridContainer", ScrollableContainer)
+            w = container.size.width if container else 0
+            if w <= 0 and self.size.width > 0:
+                w = self.size.width - 4
+            usableWidth = max(1, w - 4 - rowNumWidth - 4)
+        except Exception:
+            usableWidth = 80
+        colSepWidth = 3
+        used = self._getColWidth(targetCol)
+        for c in range(targetCol - 1, 0, -1):
+            used += colSepWidth + self._getColWidth(c)
+            if used > usableWidth:
+                return c + 1
+        return 1
+
     def _formatCell(self, val: str, width: int = 12) -> str:
         displayVal = _formatDisplayValue(val)
         escaped = _escapeForRich(displayVal)
@@ -401,9 +501,7 @@ class SheetViewScreen(Screen):
     def _renderGrid(self) -> None:
         visibleRows = self._getVisibleRows()
         rowNumWidth = max(7, _displayWidth(str(self.maxRow)) + 2)
-        visibleCols = self._getVisibleCols(rowNumWidth)
-        endCol = min(self.viewLeftCol + visibleCols - 1, self.maxCol)
-        cellWidth = 12
+        endCol = self._computeEndCol(rowNumWidth)
         colSep = " │ "
 
         lines = []
@@ -411,8 +509,9 @@ class SheetViewScreen(Screen):
             f"[bold white on blue]{_padToDisplayWidth('行号', rowNumWidth, truncate=False)}[/]"
         ]
         for c in range(self.viewLeftCol, endCol + 1):
+            colW = self._getColWidth(c)
             val = _formatDisplayValue(getCellValue(self.ws, 1, c))
-            cell = self._formatCell(val or get_column_letter(c), cellWidth)
+            cell = self._formatCell(val or get_column_letter(c), colW)
             if self.cursorRow == 1 and c == self.cursorCol:
                 headerParts.append(f"{colSep}[bold white on bright_blue]{cell}[/]")
             else:
@@ -424,8 +523,9 @@ class SheetViewScreen(Screen):
             rowNumStr = _padToDisplayWidthRight(str(r), rowNumWidth)
             rowParts = [rowNumStr]
             for c in range(self.viewLeftCol, endCol + 1):
+                colW = self._getColWidth(c)
                 val = getCellValue(self.ws, r, c)
-                cell = self._formatCell(val, cellWidth)
+                cell = self._formatCell(val, colW)
                 sep = colSep
                 if r == self.cursorRow and c == self.cursorCol:
                     rowParts.append(f"{sep}[reverse]{cell}[/reverse]")
@@ -513,9 +613,9 @@ class SheetViewScreen(Screen):
         if self.cursorCol < self.maxCol:
             self.cursorCol += 1
             rowNumWidth = max(7, _displayWidth(str(self.maxRow)) + 2)
-            visibleCols = self._getVisibleCols(rowNumWidth)
-            if self.cursorCol >= self.viewLeftCol + visibleCols:
-                self.viewLeftCol = self.cursorCol - visibleCols + 1
+            endCol = self._computeEndCol(rowNumWidth)
+            if self.cursorCol > endCol:
+                self.viewLeftCol = self._computeViewLeftToShowCol(self.cursorCol, rowNumWidth)
             self._renderGrid()
 
     def action_back(self) -> None:
@@ -606,8 +706,7 @@ class SheetViewScreen(Screen):
             return
         self.cursorCol = self.maxCol
         rowNumWidth = max(7, _displayWidth(str(self.maxRow)) + 2)
-        visibleCols = self._getVisibleCols(rowNumWidth)
-        self.viewLeftCol = max(1, self.maxCol - visibleCols + 1)
+        self.viewLeftCol = self._computeViewLeftToShowCol(self.maxCol, rowNumWidth)
         self._renderGrid()
 
     def _jumpToRow(self, targetRow: int) -> None:
@@ -639,6 +738,26 @@ class SheetViewScreen(Screen):
                 cursorCol=self.cursorCol,
             )
         )
+
+    def action_decrease_col_width(self) -> None:
+        if self.isSearchMode or self.isFilterMode or self.isGotoRowMode:
+            return
+        col = self.cursorCol
+        current = self._getColWidth(col)
+        self.columnWidths[col] = max(4, current - 2)
+        self._renderGrid()
+        self._saveColumnWidths()
+        self.notify(f"列 {col} 宽度: {self.columnWidths[col]}", timeout=1)
+
+    def action_increase_col_width(self) -> None:
+        if self.isSearchMode or self.isFilterMode or self.isGotoRowMode:
+            return
+        col = self.cursorCol
+        current = self._getColWidth(col)
+        self.columnWidths[col] = min(80, current + 2)
+        self._renderGrid()
+        self._saveColumnWidths()
+        self.notify(f"列 {col} 宽度: {self.columnWidths[col]}", timeout=1)
 
     def _exitInputMode(self) -> None:
         for inputId in ("searchInput", "filterInput", "gotoRowInput"):
@@ -834,7 +953,6 @@ class SheetViewScreen(Screen):
     def _clickToCell(self, contentX: int, contentY: int) -> None:
         """根据 #gridContent 内容区坐标映射到 (row, col) 并移动光标"""
         rowNumWidth = max(7, _displayWidth(str(self.maxRow)) + 2)
-        cellWidth = 12
         colSepWidth = 3  # " │ " 占 3 个终端列
 
         # y=0 → 表头行(row 1)，y>=1 → 对应渲染数据行
@@ -853,11 +971,23 @@ class SheetViewScreen(Screen):
             self._renderGrid()
             return
 
-        colOffset = (contentX - rowNumWidth) // (colSepWidth + cellWidth)
-        clickedCol = max(1, min(self.viewLeftCol + colOffset, self.maxCol))
+        # 按各列实际宽度逐列累积，找到点击落在哪一列
+        x = rowNumWidth
+        clickedCol = self.viewLeftCol
+        endCol = self._computeEndCol(rowNumWidth)
+        for c in range(self.viewLeftCol, endCol + 1):
+            if c > self.viewLeftCol:
+                x += colSepWidth
+            colW = self._getColWidth(c)
+            if contentX < x + colW:
+                clickedCol = c
+                break
+            x += colW
+        else:
+            clickedCol = endCol
 
         self.cursorRow = clickedRow
-        self.cursorCol = clickedCol
+        self.cursorCol = max(1, min(clickedCol, self.maxCol))
         self._renderGrid()
 
 
