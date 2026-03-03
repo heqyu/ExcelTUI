@@ -8,6 +8,7 @@ import bisect
 from pathlib import Path
 
 from openpyxl.utils import get_column_letter
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, ScrollableContainer
@@ -590,6 +591,7 @@ class SheetViewScreen(Screen):
                 self.cursorRow,
                 self.filePath,
                 cursorCol=self.cursorCol,
+                schemaData=self.schemaData,
             )
         )
 
@@ -852,6 +854,7 @@ class RowViewScreen(Screen):
     BINDINGS = [
         Binding("q", "back", "返回"),
         Binding("c", "copy_cell", "拷贝"),
+        Binding("s", "toggle_schema", "Schema"),
     ]
 
     def __init__(
@@ -861,6 +864,7 @@ class RowViewScreen(Screen):
         rowIndex: int,
         filePath: str,
         cursorCol: int = 1,
+        schemaData: dict | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -868,9 +872,11 @@ class RowViewScreen(Screen):
         self.sheetName = sheetName
         self.rowIndex = rowIndex
         self.filePath = filePath
+        self.schemaData = schemaData
         self.ws = workbook[sheetName]
         self.maxCol = self.ws.max_column or 1
         self._initCursorCol = min(max(1, cursorCol), self.maxCol)
+        self.schemaVisible: bool = bool(schemaData and sheetName in schemaData)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -882,25 +888,68 @@ class RowViewScreen(Screen):
         yield DataTable(id="rowTable", cursor_type="row", zebra_stripes=True)
         yield Footer()
 
-    def on_mount(self) -> None:
-        rows: list[tuple[str, str]] = []
-        for c in range(1, self.maxCol + 1):
-            fieldName = getCellValue(self.ws, 1, c) or get_column_letter(c)
-            val = formatDisplayValue(getCellValue(self.ws, self.rowIndex, c))
-            rows.append((fieldName, val))
+    def _getEnName(self, cnFieldName: str) -> str:
+        schemaEntry = (self.schemaData or {}).get(self.sheetName)
+        if not schemaEntry:
+            return ""
+        mapping = schemaEntry["cnToEn"].get(cnFieldName)
+        return mapping[0] if mapping else ""
 
-        nameWidth = max((displayWidth(r[0]) for r in rows), default=4)
-        nameWidth = max(nameWidth, displayWidth("字段名"))
-        valWidth = max((displayWidth(r[1]) for r in rows), default=4)
-        valWidth = max(valWidth, displayWidth("值"))
+    def _buildTable(self) -> None:
+        rows: list[tuple] = []
+        for c in range(1, self.maxCol + 1):
+            cnName = getCellValue(self.ws, 1, c) or get_column_letter(c)
+            val = formatDisplayValue(getCellValue(self.ws, self.rowIndex, c))
+            if self.schemaVisible:
+                enName = self._getEnName(cnName)
+                rows.append((cnName, enName, val))
+            else:
+                rows.append((cnName, val))
 
         table = self.query_one(DataTable)
-        table.add_column("字段名", width=nameWidth)
-        table.add_column("值", width=valWidth)
-        for fieldName, val in rows:
-            table.add_row(fieldName, val)
-        table.move_cursor(row=self._initCursorCol - 1)
-        table.focus()
+        savedRow = table.cursor_row
+        table.clear(columns=True)
+
+        if self.schemaVisible:
+            nameWidth = max((displayWidth(r[0]) for r in rows), default=4)
+            nameWidth = max(nameWidth, displayWidth("列名"))
+            enWidth = max((displayWidth(r[1]) for r in rows), default=4)
+            enWidth = max(enWidth, displayWidth("Field"))
+            valWidth = max((displayWidth(r[2]) for r in rows), default=4)
+            valWidth = max(valWidth, displayWidth("值"))
+            table.add_column("列名", width=nameWidth)
+            table.add_column("Field", width=enWidth)
+            table.add_column("值", width=valWidth)
+            for cnName, enName, val in rows:
+                table.add_row(
+                    Text(cnName, style="bold yellow"),
+                    Text(enName, style="cyan"),
+                    val,
+                )
+        else:
+            nameWidth = max((displayWidth(r[0]) for r in rows), default=4)
+            nameWidth = max(nameWidth, displayWidth("列名"))
+            valWidth = max((displayWidth(r[1]) for r in rows), default=4)
+            valWidth = max(valWidth, displayWidth("值"))
+            table.add_column("列名", width=nameWidth)
+            table.add_column("值", width=valWidth)
+            for cnName, val in rows:
+                table.add_row(Text(cnName, style="bold yellow"), val)
+
+        table.move_cursor(row=min(savedRow, len(rows) - 1))
+
+    def on_mount(self) -> None:
+        self._buildTable()
+        self.query_one(DataTable).move_cursor(row=self._initCursorCol - 1)
+        self.query_one(DataTable).focus()
+
+    def action_toggle_schema(self) -> None:
+        if not (self.schemaData and self.sheetName in self.schemaData):
+            self.notify("当前 Sheet 无 schema 配置", timeout=2)
+            return
+        self.schemaVisible = not self.schemaVisible
+        self._buildTable()
+        self.query_one(DataTable).focus()
 
     @property
     def cursorCol(self) -> int:
